@@ -1,7 +1,7 @@
 import datetime
+from typing import Optional, Generator, Tuple, List
 
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, String, Integer, BigInteger, LargeBinary, orm
+from sqlalchemy import Column, String, Integer, BigInteger, LargeBinary, Table
 import sqlalchemy as sql
 
 from telethon.sessions.memory import MemorySession, _SentFileType
@@ -15,126 +15,87 @@ LATEST_VERSION = 2
 
 
 class AlchemySessionContainer:
-    def __init__(self, engine=None, session=None, table_prefix="",
-                 table_base=None, manage_tables=True):
+    def __init__(self, engine=None, connection: sql.engine.Connection = None,
+                 table_metadata: sql.MetaData = None, table_prefix: str = "",
+                 manage_tables: bool = True):
         if isinstance(engine, str):
             engine = sql.create_engine(engine)
 
         self.db_engine = engine
-        if not session:
-            db_factory = orm.sessionmaker(bind=self.db_engine)
-            self.db = orm.scoping.scoped_session(db_factory)
+        if not connection:
+            self.db = self.db_engine.connect()  # type: sql.engine.Connection
         else:
-            self.db = session
+            self.db = connection  # type: sql.engine.Connection
 
-        table_base = table_base or declarative_base()
-        (self.Version, self.Session, self.Entity,
-         self.SentFile, self.UpdateState) = self.create_table_classes(self.db, table_prefix,
-                                                                      table_base)
+        (self.version, self.sessions, self.entities, self.sent_files,
+         self.update_state) = self.create_table_classes(table_prefix, table_metadata)
 
         if manage_tables:
-            table_base.metadata.bind = self.db_engine
-            if not self.db_engine.dialect.has_table(self.db_engine,
-                                                    self.Version.__tablename__):
-                table_base.metadata.create_all()
-                self.db.add(self.Version(version=LATEST_VERSION))
-                self.db.commit()
+            if not self.version.exists(self.db_engine):
+                self.version.create(self.db_engine)
+                self.sessions.create(self.db_engine)
+                self.entities.create(self.db_engine)
+                self.sent_files.create(self.db_engine)
+                self.update_state.create(self.db_engine)
+                self.db.execute(self.version.insert().values(version=LATEST_VERSION))
             else:
                 self.check_and_upgrade_database()
 
     @staticmethod
-    def create_table_classes(db, prefix, Base):
-        class Version(Base):
-            query = db.query_property()
-            __tablename__ = "{prefix}version".format(prefix=prefix)
-            version = Column(Integer, primary_key=True)
+    def create_table_classes(prefix: str, metadata: sql.MetaData
+                             ) -> Tuple[Table, Table, Table, Table, Table]:
+        version = Table("{prefix}version".format(prefix=prefix), metadata,
+                        Column("version", Integer, primary_key=True))
+        sessions = Table("{prefix}sessions".format(prefix=prefix), metadata,
+                         Column("session_id", String(255), primary_key=True),
+                         Column("dc_id", Integer, primary_key=True),
+                         Column("server_address", String(255)),
+                         Column("port", Integer),
+                         Column("auth_key", LargeBinary))
+        entities = Table("{prefix}entities".format(prefix=prefix), metadata,
+                         Column("session_id", String(255), primary_key=True),
+                         Column("id", BigInteger, primary_key=True),
+                         Column("hash", BigInteger, nullable=False),
+                         Column("username", String(32)),
+                         Column("phone", BigInteger),
+                         Column("name", String(255)))
+        sent_files = Table("{prefix}sent_files".format(prefix=prefix), metadata,
+                           Column("session_id", String(255), primary_key=True),
+                           Column("md5_digest", LargeBinary, primary_key=True),
+                           Column("file_size", Integer, primary_key=True),
+                           Column("type", Integer, primary_key=True),
+                           Column("id", BigInteger),
+                           Column("hash", BigInteger))
+        update_state = Table("{prefix}update_state".format(prefix=prefix), metadata,
+                             Column("session_id", String(255), primary_key=True),
+                             Column("entity_id", BigInteger, primary_key=True),
+                             Column("pts", BigInteger),
+                             Column("qts", BigInteger),
+                             Column("date", BigInteger),
+                             Column("seq", BigInteger),
+                             Column("unread_count", Integer))
+        return version, sessions, entities, sent_files, update_state
 
-            def __str__(self):
-                return "Version('{}')".format(self.version)
-
-        class Session(Base):
-            query = db.query_property()
-            __tablename__ = '{prefix}sessions'.format(prefix=prefix)
-
-            session_id = Column(String(255), primary_key=True)
-            dc_id = Column(Integer, primary_key=True)
-            server_address = Column(String(255))
-            port = Column(Integer)
-            auth_key = Column(LargeBinary)
-
-            def __str__(self):
-                return "Session('{}', {}, '{}', {}, {})".format(self.session_id, self.dc_id,
-                                                                self.server_address, self.port,
-                                                                self.auth_key)
-
-        class Entity(Base):
-            query = db.query_property()
-            __tablename__ = '{prefix}entities'.format(prefix=prefix)
-
-            session_id = Column(String(255), primary_key=True)
-            id = Column(BigInteger, primary_key=True)
-            hash = Column(BigInteger, nullable=False)
-            username = Column(String(32))
-            phone = Column(BigInteger)
-            name = Column(String(255))
-
-            def __str__(self):
-                return "Entity('{}', {}, {}, '{}', '{}', '{}')".format(self.session_id, self.id,
-                                                                       self.hash, self.username,
-                                                                       self.phone, self.name)
-
-        class SentFile(Base):
-            query = db.query_property()
-            __tablename__ = '{prefix}sent_files'.format(prefix=prefix)
-
-            session_id = Column(String(255), primary_key=True)
-            md5_digest = Column(LargeBinary, primary_key=True)
-            file_size = Column(Integer, primary_key=True)
-            type = Column(Integer, primary_key=True)
-            id = Column(BigInteger)
-            hash = Column(BigInteger)
-
-            def __str__(self):
-                return "SentFile('{}', {}, {}, {}, {}, {})".format(self.session_id,
-                                                                   self.md5_digest, self.file_size,
-                                                                   self.type, self.id, self.hash)
-
-        class UpdateState(Base):
-            query = db.query_property()
-            __tablename__ = "{prefix}update_state".format(prefix=prefix)
-
-            session_id = Column(String(255), primary_key=True)
-            entity_id = Column(BigInteger, primary_key=True)
-            pts = Column(BigInteger)
-            qts = Column(BigInteger)
-            date = Column(BigInteger)
-            seq = Column(BigInteger)
-            unread_count = Column(Integer)
-
-        return Version, Session, Entity, SentFile, UpdateState
-
-    def _add_column(self, table, column):
+    def _add_column(self, table: Table, column: sql.Column) -> None:
         column_name = column.compile(dialect=self.db_engine.dialect)
         column_type = column.type.compile(self.db_engine.dialect)
-        self.db_engine.execute("ALTER TABLE {} ADD COLUMN {} {}".format(
-            table.__tablename__, column_name, column_type))
+        self.db.execute("ALTER TABLE {} ADD COLUMN {} {}".format(
+            table.name, column_name, column_type))
 
-    def check_and_upgrade_database(self):
-        row = self.Version.query.all()
-        version = row[0].version if row else 1
+    def check_and_upgrade_database(self) -> None:
+        res = self.db.execute(sql.select([self.version.version]))  # type: sql.engine.ResultProxy
+        row = res.fetchone()
+        version = row[0][0] if row and row[0] else 1
         if version == LATEST_VERSION:
             return
 
-        self.Version.query.delete()
-
         if version == 1:
-            self.UpdateState.__table__.create(self.db_engine)
+            self.update_state.create(self.db_engine)
             version = 3
         elif version == 2:
-            self._add_column(self.UpdateState, Column(type=Integer, name="unread_count"))
+            self._add_column(self.update_state, Column(type=Integer, name="unread_count"))
 
-        self.db.add(self.Version(version=version))
-        self.db.commit()
+        self.db.execute(self.version.update(values=(LATEST_VERSION,)))
 
     def new_session(self, session_id):
         return AlchemySession(self, session_id)
@@ -143,28 +104,31 @@ class AlchemySessionContainer:
         return
 
     def save(self):
-        self.db.commit()
+        pass
 
 
 class AlchemySession(MemorySession):
-    def __init__(self, container, session_id):
+    def __init__(self, container: AlchemySessionContainer, session_id: str):
         super().__init__()
-        self.container = container
-        self.db = container.db
-        self.Version, self.Session, self.Entity, self.SentFile, self.UpdateState = (
-            container.Version, container.Session, container.Entity,
-            container.SentFile, container.UpdateState)
-        self.session_id = session_id
+        self.container = container  # type: AlchemySessionContainer
+        self.db = container.db  # type: sql.engine.Connection
+        self.version, self.sessions, self.entities, self.sent_files, self.update_state = (
+            container.version, container.sessions, container.entities,
+            container.sent_files, container.update_state)
+        self.session_id = session_id  # type: str
         self._load_session()
 
+    def select_all(self, table: Table) -> sql.engine.ResultProxy:
+        return self.db.execute(sql.select([table]).where(table.c.session_id == self.session_id))
+
+    def select_columns(self, table: Table, *args: List[Column]) -> sql.engine.ResultProxy:
+        return self.db.execute(sql.select(args).where(table.c.session_id == self.session_id))
+
     def _load_session(self):
-        sessions = self._db_query(self.Session).all()
-        session = sessions[0] if sessions else None
-        if session:
-            self._dc_id = session.dc_id
-            self._server_address = session.server_address
-            self._port = session.port
-            self._auth_key = AuthKey(data=session.auth_key)
+        row = self.select_all(self.sessions).fetchone()
+        if row:
+            _, self._dc_id, self._server_address, self._port, auth_key = row
+            self._auth_key = AuthKey(data=auth_key)
 
     def clone(self, to_instance=None):
         return super().clone(MemorySession())
@@ -180,14 +144,27 @@ class AlchemySession(MemorySession):
         else:
             self._auth_key = None
 
-    def get_update_state(self, entity_id):
-        row = self.UpdateState.query.get((self.session_id, entity_id))
+    @staticmethod
+    def _row_to_update_state(row) -> Optional[updates.State]:
         if row:
-            row.date = datetime.datetime.utcfromtimestamp(row.date)
-            return updates.State(row.pts, row.qts, row.date, row.seq, row.unread_count)
+            date = datetime.datetime.fromtimestamp(row.date, tz=datetime.timezone.utc)
+            return updates.State(row.pts, row.qts, date, row.seq, row.unread_count)
+        return None
 
-    def set_update_state(self, entity_id, row):
+    def iter_update_states(self) -> Generator[updates.State]:
+        rows = self.UpdateState.query.filter(self.UpdateState.session_id == self.session_id).all()
+        for row in rows:
+            if row.entity_id != 0:
+                state = self._row_to_update_state(row)
+                if state:
+                    yield row.entity_id, state
+
+    def get_update_state(self, entity_id: int) -> updates.State:
+        return self._row_to_update_state(self.select_all(self.update_state).fetchone())
+
+    def set_update_state(self, entity_id: int, row: updates.State) -> None:
         if row:
+
             self.db.merge(self.UpdateState(session_id=self.session_id, entity_id=entity_id,
                                            pts=row.pts, qts=row.qts, date=row.date.timestamp(),
                                            seq=row.seq,
